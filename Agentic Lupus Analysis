@@ -1,1 +1,130 @@
-{"metadata":{"kernelspec":{"language":"python","display_name":"Python 3","name":"python3"},"language_info":{"name":"python","version":"3.11.13","mimetype":"text/x-python","codemirror_mode":{"name":"ipython","version":3},"pygments_lexer":"ipython3","nbconvert_exporter":"python","file_extension":".py"},"kaggle":{"accelerator":"none","dataSources":[{"sourceId":121144,"databundleVersionId":14484960,"sourceType":"competition"}],"dockerImageVersionId":31192,"isInternetEnabled":true,"language":"python","sourceType":"notebook","isGpuEnabled":false}},"nbformat_minor":4,"nbformat":4,"cells":[{"cell_type":"markdown","source":"**Installing Dependencies**\n\nLeveraging:\n* VertexAI\n* > LangChain/LangGraph\n* DDGS- Web and News Search","metadata":{}},{"cell_type":"code","source":"!pip install --upgrade --quiet langchain langgraph langchain-google-vertexai langchain-community duckduckgo-search ddgs\n!pip install --upgrade --quiet google-cloud-aiplatform","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-11-23T22:49:44.464830Z","iopub.execute_input":"2025-11-23T22:49:44.465229Z","iopub.status.idle":"2025-11-23T22:49:55.022153Z","shell.execute_reply.started":"2025-11-23T22:49:44.465203Z","shell.execute_reply":"2025-11-23T22:49:55.020841Z"}},"outputs":[],"execution_count":null},{"cell_type":"markdown","source":"**Authentication & Setup**\n\nBuilt initially in *Google Colab*\nAuthentication is required to access Vertex AI resources.","metadata":{}},{"cell_type":"code","source":"import sys\nimport os\nfrom google.colab import auth\n\n# Authenticate the Colab user to access Vertex AI\nauth.authenticate_user()\n\n# Set your Project ID and Region\nPROJECT_ID = \"INSERT YOUR PROJECT ID\"  \nLOCATION = \"us-central1 - OR OTHER\"            \n\n# Initialize Vertex AI SDK\nimport vertexai\nvertexai.init(project=PROJECT_ID, location=LOCATION)","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-11-23T22:45:38.866171Z","iopub.execute_input":"2025-11-23T22:45:38.866564Z","iopub.status.idle":"2025-11-23T22:45:38.981617Z","shell.execute_reply.started":"2025-11-23T22:45:38.866528Z","shell.execute_reply":"2025-11-23T22:45:38.980453Z"}},"outputs":[],"execution_count":null},{"cell_type":"code","source":"from typing import TypedDict, Annotated, List, Dict\nimport operator\nfrom langgraph.graph import StateGraph, END, START\nfrom langchain_google_vertexai import ChatVertexAI\nfrom langchain_community.tools.pubmed.tool import PubmedQueryRun\nfrom langchain_core.messages import SystemMessage, HumanMessage, BaseMessage, ToolMessage, AIMessage\nfrom langchain_core.tools import tool\nfrom duckduckgo_search import DDGS\n\n# --- 1. Define Agent State ---\nclass AgentState(TypedDict):\n    messages: Annotated[List[BaseMessage], operator.add]\n    final_report: str\n\n# --- 2. Define Tools (Colab-Ready) ---\n\n# Tool 1: PubMed Search (Using LangChain Community Tool)\npubmed_tool = PubmedQueryRun()\n\n# Tool 2: Web Search using DDGS for general text search\n@tool\ndef duckduckgo_text_search(query: str) -> str:\n    \"\"\"\n    Performs a general web search using DuckDuckGo and returns text results.\n    \"\"\"\n    with DDGS() as ddgs:\n        results = ddgs.text(keywords=query, max_results=5)\n        return str(results)\n\n# Tool 3: Web Search using DDGS for news search\n@tool\ndef duckduckgo_news_search(query: str) -> str:\n    \"\"\"\n    Performs a news search using DuckDuckGo and returns news articles.\n    \"\"\"\n    with DDGS() as ddgs:\n        results = ddgs.news(keywords=query, max_results=5)\n        return str(results)\n\n# --- 3. Define the Graph Logic ---\n\n# Initialize Gemini 2.5 Pro\nllm = ChatVertexAI(\n    model=\"gemini-2.5-pro\", # Changed model name to the general alias\n    temperature=0.1\n)\n\n# Bind tools to the LLM so it knows how to call them\ntools = [pubmed_tool, duckduckgo_text_search, duckduckgo_news_search, query_knowledge_graph]\nllm_with_tools = llm.bind_tools(tools)\n\ndef scout_agent(state: AgentState):\n    \"\"\"\n    Role: Scout. Searches for raw information.\n    \"\"\"\n    print(\"--- SCOUT AGENT WORKING ---\")\n    messages = state['messages']\n\n    sys_msg = SystemMessage(content=\"\"\"\n    You are a Literature Scout. Your goal is to find research papers and news.\n    Use the 'pubmed_tool' to find academic papers on Epstein-Barr Virus (EBV) and Lupus.\n    Use the 'duckduckgo_news_search' tool to find recent news about \"Stanford EBV Lupus 2025\".\n    Use the 'duckduckgo_text_search' tool for general web searches related to \"Epstein-Barr Virus and Lupus research breakthroughs\".\n    Always prioritize using the search tools if you need more information.\n    \"\"\")\n\n    response = llm_with_tools.invoke([sys_msg] + messages)\n    return {\"messages\": [response]}\n\ndef call_tools(state: AgentState):\n    \"\"\"\n    Executes tools suggested by the Scout agent.\n    \"\"\"\n    print(\"--- CALLING TOOLS ---\")\n    last_message = state['messages'][-1]\n    tool_outputs = []\n    for tool_call in last_message.tool_calls:\n        # The error indicates tool_call is a dict, so access using dictionary keys\n        tool_name = tool_call['name']\n        tool_args = tool_call['args']\n        tool_call_id = tool_call['id']\n\n        if tool_name == \"pubmed_tool\":\n            output = pubmed_tool.invoke(tool_args)\n            tool_outputs.append(ToolMessage(tool_call_id=tool_call_id, content=str(output)))\n        elif tool_name == \"duckduckgo_text_search\":\n            output = duckduckgo_text_search.invoke(tool_args)\n            tool_outputs.append(ToolMessage(tool_call_id=tool_call_id, content=str(output)))\n        elif tool_name == \"duckduckgo_news_search\":\n            output = duckduckgo_news_search.invoke(tool_args)\n            tool_outputs.append(ToolMessage(tool_call_id=tool_call_id, content=str(output)))\n        elif tool_name == \"query_knowledge_graph\":\n            # tool_args for KG is expected to be a dict, access 'query'\n            output = query_knowledge_graph(tool_args['query'])\n            tool_outputs.append(ToolMessage(tool_call_id=tool_call_id, content=str(output)))\n        else:\n            tool_outputs.append(ToolMessage(tool_call_id=tool_call_id, content=f\"Tool {tool_name} not found.\"))\n\n    return {\"messages\": tool_outputs}\n\ndef analyst_agent(state: AgentState):\n    \"\"\"\n    Role: Analyst. Looks for correlations in the graph.\n    This node now also processes tool outputs from the state.\n    \"\"\"\n    print(\"--- ANALYST AGENT WORKING ---\")\n    messages = state['messages']\n    last_message = messages[-1]\n\n    # The analyst should synthesize information, including tool outputs\n    # For this simplified demo, we'll just check if tools ran.\n    analysis_content = \"Analyst: No specific correlation found yet, waiting for more data.\"\n    for msg in messages:\n        if isinstance(msg, ToolMessage):\n            if \"GRAPH_RESULT\" in msg.content:\n                analysis_content = \"Analyst: Verified correlation between EBNA2 and ZEB2 loci from KG.\"\n            elif \"pubmed\" in msg.content or \"duckduckgo\" in msg.content:\n                analysis_content = \"Analyst: Processed search results and looking for patterns.\"\n\n    # A more sophisticated analyst would invoke the LLM to summarize/correlate\n    # For now, we'll just add a placeholder message.\n    return {\"messages\": [HumanMessage(content=analysis_content)]}\n\ndef scribe_agent(state: AgentState):\n    \"\"\"\n    Role: Scribe. Writes the report.\n    \"\"\"\n    print(\"--- SCRIBE AGENT WORKING ---\")\n    messages = state['messages']\n\n    prompt = \"\"\"\n    Based on all the findings from the Scout and any analysis from the Analyst,\n    write a brief executive summary linking EBV to Multiple Sclerosis.\n    Synthesize information from PubMed, web searches, and any knowledge graph insights.\n    If there are no findings, state that no relevant information was retrieved.\n    \"\"\"\n\n    response = llm.invoke(messages + [HumanMessage(content=prompt)])\n    return {\"final_report\": response.content}\n\n# --- Helper function for conditional edge ---\ndef should_continue(state: AgentState) -> str:\n    last_message = state['messages'][-1]\n    if last_message.tool_calls:\n        return \"continue_with_tools\"\n    else:\n        return \"continue_to_analyst\"\n\n# --- 4. Construct Graph ---\n\nworkflow = StateGraph(AgentState)\n\nworkflow.add_node(\"scout\", scout_agent)\nworkflow.add_node(\"call_tools\", call_tools)\nworkflow.add_node(\"analyst\", analyst_agent)\nworkflow.add_node(\"scribe\", scribe_agent)\n\n# Define the flow with conditional edges\nworkflow.add_edge(START, \"scout\")\n\n# If scout suggests tools, call them. Otherwise, go to analyst.\nworkflow.add_conditional_edges(\n    \"scout\",\n    should_continue,\n    {\n        \"continue_with_tools\": \"call_tools\",\n        \"continue_to_analyst\": \"analyst\",\n    },\n)\n\n# After tools are called, go back to the scout to potentially refine or continue\n# Or, for this flow, directly to analyst to process tool outputs\nworkflow.add_edge(\"call_tools\", \"analyst\") # Changed to go directly to analyst for simplicity\nworkflow.add_edge(\"analyst\", \"scribe\")\nworkflow.add_edge(\"scribe\", END)\n\n# Compile the application\napp = workflow.compile()","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-11-23T23:03:34.767005Z","iopub.execute_input":"2025-11-23T23:03:34.767308Z","iopub.status.idle":"2025-11-23T23:03:34.823215Z","shell.execute_reply.started":"2025-11-23T23:03:34.767281Z","shell.execute_reply":"2025-11-23T23:03:34.822247Z"}},"outputs":[],"execution_count":null},{"cell_type":"code","source":"from IPython.display import Image, display\n\ntry:\n    display(Image(app.get_graph().draw_mermaid_png()))\nexcept Exception:\n    # Fallback if mermaid rendering fails in specific Colab environments\n    print(app.get_graph().draw_ascii())","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-11-23T23:03:44.408370Z","iopub.execute_input":"2025-11-23T23:03:44.408691Z","iopub.status.idle":"2025-11-23T23:03:44.543805Z","shell.execute_reply.started":"2025-11-23T23:03:44.408671Z","shell.execute_reply":"2025-11-23T23:03:44.542806Z"}},"outputs":[],"execution_count":null},{"cell_type":"code","source":"initial_query = \"Investigate the 2025 Stanford study linking EBV to Lupus.\"\n\nresult = app.invoke({\"messages\": [HumanMessage(content=initial_query)]})\n\nprint(\"\\n\\n=== FINAL AGENT REPORT ===\\n\")\n\nfinal_report_content = result[\"final_report\"]\n\nif isinstance(final_report_content, list):\n    for i, report_segment in enumerate(final_report_content):\n        print(f\"--- Report Segment {i+1} ---\")\n        print(report_segment)\n        print(\"\\n\" + \"=\"*80 + \"\\n\") # Clear separator\nelse:\n    print(final_report_content)","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2025-11-23T23:04:37.454086Z","iopub.execute_input":"2025-11-23T23:04:37.454475Z","iopub.status.idle":"2025-11-23T23:05:06.832708Z","shell.execute_reply.started":"2025-11-23T23:04:37.454450Z","shell.execute_reply":"2025-11-23T23:05:06.831629Z"}},"outputs":[],"execution_count":null}]}
+{
+  "metadata": {
+    "kernelspec": {
+      "language": "python",
+      "display_name": "Python 3",
+      "name": "python3"
+    },
+    "language_info": {
+      "name": "python",
+      "version": "3.11.13",
+      "mimetype": "text/x-python",
+      "codemirror_mode": {
+        "name": "ipython",
+        "version": 3
+      },
+      "pygments_lexer": "ipython3",
+      "nbconvert_exporter": "python",
+      "file_extension": ".py"
+    },
+    "kaggle": {
+      "accelerator": "none",
+      "dataSources": [
+        {
+          "sourceId": 121144,
+          "databundleVersionId": 14484960,
+          "sourceType": "competition"
+        }
+      ],
+      "dockerImageVersionId": 31192,
+      "isInternetEnabled": true,
+      "language": "python",
+      "sourceType": "notebook",
+      "isGpuEnabled": false
+    }
+  },
+  "nbformat_minor": 4,
+  "nbformat": 4,
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "source": "**Installing Dependencies**\n\nLeveraging:\n* VertexAI\n* > LangChain/LangGraph\n* DDGS- Web and News Search",
+      "metadata": {}
+    },
+    {
+      "cell_type": "code",
+      "source": "!pip install --upgrade --quiet langchain langgraph langchain-google-vertexai langchain-community duckduckgo-search ddgs\n!pip install --upgrade --quiet google-cloud-aiplatform",
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-11-23T22:49:44.464830Z",
+          "iopub.execute_input": "2025-11-23T22:49:44.465229Z",
+          "iopub.status.idle": "2025-11-23T22:49:55.022153Z",
+          "shell.execute_reply.started": "2025-11-23T22:49:44.465203Z",
+          "shell.execute_reply": "2025-11-23T22:49:55.020841Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "source": "**Authentication & Setup**\n\nBuilt initially in *Google Colab*\nAuthentication is required to access Vertex AI resources.",
+      "metadata": {}
+    },
+    {
+      "cell_type": "code",
+      "source": "import sys\nimport os\nfrom google.colab import auth\n\n# Authenticate the Colab user to access Vertex AI\nauth.authenticate_user()\n\n# Set your Project ID and Region\nPROJECT_ID = \"INSERT YOUR PROJECT ID\"  \nLOCATION = \"us-central1 - OR OTHER\"            \n\n# Initialize Vertex AI SDK\nimport vertexai\nvertexai.init(project=PROJECT_ID, location=LOCATION)",
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-11-23T22:45:38.866171Z",
+          "iopub.execute_input": "2025-11-23T22:45:38.866564Z",
+          "iopub.status.idle": "2025-11-23T22:45:38.981617Z",
+          "shell.execute_reply.started": "2025-11-23T22:45:38.866528Z",
+          "shell.execute_reply": "2025-11-23T22:45:38.980453Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "code",
+      "source": "from typing import TypedDict, Annotated, List, Dict\nimport operator\nfrom langgraph.graph import StateGraph, END, START\nfrom langchain_google_vertexai import ChatVertexAI\nfrom langchain_community.tools.pubmed.tool import PubmedQueryRun\nfrom langchain_core.messages import SystemMessage, HumanMessage, BaseMessage, ToolMessage, AIMessage\nfrom langchain_core.tools import tool\nfrom duckduckgo_search import DDGS\n\n# --- 1. Define Agent State ---\nclass AgentState(TypedDict):\n    messages: Annotated[List[BaseMessage], operator.add]\n    final_report: str\n\n# --- 2. Define Tools (Colab-Ready) ---\n\n# Tool 1: PubMed Search (Using LangChain Community Tool)\npubmed_tool = PubmedQueryRun()\n\n# Tool 2: Web Search using DDGS for general text search\n@tool\ndef duckduckgo_text_search(query: str) -> str:\n    \"\"\"\n    Performs a general web search using DuckDuckGo and returns text results.\n    \"\"\"\n    with DDGS() as ddgs:\n        results = ddgs.text(keywords=query, max_results=5)\n        return str(results)\n\n# Tool 3: Web Search using DDGS for news search\n@tool\ndef duckduckgo_news_search(query: str) -> str:\n    \"\"\"\n    Performs a news search using DuckDuckGo and returns news articles.\n    \"\"\"\n    with DDGS() as ddgs:\n        results = ddgs.news(keywords=query, max_results=5)\n        return str(results)\n\n# --- 3. Define the Graph Logic ---\n\n# Initialize Gemini 2.5 Pro\nllm = ChatVertexAI(\n    model=\"gemini-2.5-pro\", # Changed model name to the general alias\n    temperature=0.1\n)\n\n# Bind tools to the LLM so it knows how to call them\ntools = [pubmed_tool, duckduckgo_text_search, duckduckgo_news_search, query_knowledge_graph]\nllm_with_tools = llm.bind_tools(tools)\n\ndef scout_agent(state: AgentState):\n    \"\"\"\n    Role: Scout. Searches for raw information.\n    \"\"\"\n    print(\"--- SCOUT AGENT WORKING ---\")\n    messages = state['messages']\n\n    sys_msg = SystemMessage(content=\"\"\"\n    You are a Literature Scout. Your goal is to find research papers and news.\n    Use the 'pubmed_tool' to find academic papers on Epstein-Barr Virus (EBV) and Lupus.\n    Use the 'duckduckgo_news_search' tool to find recent news about \"Stanford EBV Lupus 2025\".\n    Use the 'duckduckgo_text_search' tool for general web searches related to \"Epstein-Barr Virus and Lupus research breakthroughs\".\n    Always prioritize using the search tools if you need more information.\n    \"\"\")\n\n    response = llm_with_tools.invoke([sys_msg] + messages)\n    return {\"messages\": [response]}\n\ndef call_tools(state: AgentState):\n    \"\"\"\n    Executes tools suggested by the Scout agent.\n    \"\"\"\n    print(\"--- CALLING TOOLS ---\")\n    last_message = state['messages'][-1]\n    tool_outputs = []\n    for tool_call in last_message.tool_calls:\n        # The error indicates tool_call is a dict, so access using dictionary keys\n        tool_name = tool_call['name']\n        tool_args = tool_call['args']\n        tool_call_id = tool_call['id']\n\n        if tool_name == \"pubmed_tool\":\n            output = pubmed_tool.invoke(tool_args)\n            tool_outputs.append(ToolMessage(tool_call_id=tool_call_id, content=str(output)))\n        elif tool_name == \"duckduckgo_text_search\":\n            output = duckduckgo_text_search.invoke(tool_args)\n            tool_outputs.append(ToolMessage(tool_call_id=tool_call_id, content=str(output)))\n        elif tool_name == \"duckduckgo_news_search\":\n            output = duckduckgo_news_search.invoke(tool_args)\n            tool_outputs.append(ToolMessage(tool_call_id=tool_call_id, content=str(output)))\n        elif tool_name == \"query_knowledge_graph\":\n            # tool_args for KG is expected to be a dict, access 'query'\n            output = query_knowledge_graph(tool_args['query'])\n            tool_outputs.append(ToolMessage(tool_call_id=tool_call_id, content=str(output)))\n        else:\n            tool_outputs.append(ToolMessage(tool_call_id=tool_call_id, content=f\"Tool {tool_name} not found.\"))\n\n    return {\"messages\": tool_outputs}\n\ndef analyst_agent(state: AgentState):\n    \"\"\"\n    Role: Analyst. Looks for correlations in the graph.\n    This node now also processes tool outputs from the state.\n    \"\"\"\n    print(\"--- ANALYST AGENT WORKING ---\")\n    messages = state['messages']\n    last_message = messages[-1]\n\n    # The analyst should synthesize information, including tool outputs\n    # For this simplified demo, we'll just check if tools ran.\n    analysis_content = \"Analyst: No specific correlation found yet, waiting for more data.\"\n    for msg in messages:\n        if isinstance(msg, ToolMessage):\n            if \"GRAPH_RESULT\" in msg.content:\n                analysis_content = \"Analyst: Verified correlation between EBNA2 and ZEB2 loci from KG.\"\n            elif \"pubmed\" in msg.content or \"duckduckgo\" in msg.content:\n                analysis_content = \"Analyst: Processed search results and looking for patterns.\"\n\n    # A more sophisticated analyst would invoke the LLM to summarize/correlate\n    # For now, we'll just add a placeholder message.\n    return {\"messages\": [HumanMessage(content=analysis_content)]}\n\ndef scribe_agent(state: AgentState):\n    \"\"\"\n    Role: Scribe. Writes the report.\n    \"\"\"\n    print(\"--- SCRIBE AGENT WORKING ---\")\n    messages = state['messages']\n\n    prompt = \"\"\"\n    Based on all the findings from the Scout and any analysis from the Analyst,\n    write a brief executive summary linking EBV to Multiple Sclerosis.\n    Synthesize information from PubMed, web searches, and any knowledge graph insights.\n    If there are no findings, state that no relevant information was retrieved.\n    \"\"\"\n\n    response = llm.invoke(messages + [HumanMessage(content=prompt)])\n    return {\"final_report\": response.content}\n\n# --- Helper function for conditional edge ---\ndef should_continue(state: AgentState) -> str:\n    last_message = state['messages'][-1]\n    if last_message.tool_calls:\n        return \"continue_with_tools\"\n    else:\n        return \"continue_to_analyst\"\n\n# --- 4. Construct Graph ---\n\nworkflow = StateGraph(AgentState)\n\nworkflow.add_node(\"scout\", scout_agent)\nworkflow.add_node(\"call_tools\", call_tools)\nworkflow.add_node(\"analyst\", analyst_agent)\nworkflow.add_node(\"scribe\", scribe_agent)\n\n# Define the flow with conditional edges\nworkflow.add_edge(START, \"scout\")\n\n# If scout suggests tools, call them. Otherwise, go to analyst.\nworkflow.add_conditional_edges(\n    \"scout\",\n    should_continue,\n    {\n        \"continue_with_tools\": \"call_tools\",\n        \"continue_to_analyst\": \"analyst\",\n    },\n)\n\n# After tools are called, go back to the scout to potentially refine or continue\n# Or, for this flow, directly to analyst to process tool outputs\nworkflow.add_edge(\"call_tools\", \"analyst\") # Changed to go directly to analyst for simplicity\nworkflow.add_edge(\"analyst\", \"scribe\")\nworkflow.add_edge(\"scribe\", END)\n\n# Compile the application\napp = workflow.compile()",
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-11-23T23:03:34.767005Z",
+          "iopub.execute_input": "2025-11-23T23:03:34.767308Z",
+          "iopub.status.idle": "2025-11-23T23:03:34.823215Z",
+          "shell.execute_reply.started": "2025-11-23T23:03:34.767281Z",
+          "shell.execute_reply": "2025-11-23T23:03:34.822247Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "code",
+      "source": "from IPython.display import Image, display\n\ntry:\n    display(Image(app.get_graph().draw_mermaid_png()))\nexcept Exception:\n    # Fallback if mermaid rendering fails in specific Colab environments\n    print(app.get_graph().draw_ascii())",
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-11-23T23:03:44.408370Z",
+          "iopub.execute_input": "2025-11-23T23:03:44.408691Z",
+          "iopub.status.idle": "2025-11-23T23:03:44.543805Z",
+          "shell.execute_reply.started": "2025-11-23T23:03:44.408671Z",
+          "shell.execute_reply": "2025-11-23T23:03:44.542806Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "code",
+      "source": "initial_query = \"Investigate the 2025 Stanford study linking EBV to Lupus.\"\n\nresult = app.invoke({\"messages\": [HumanMessage(content=initial_query)]})\n\nprint(\"\\n\\n=== FINAL AGENT REPORT ===\\n\")\n\nfinal_report_content = result[\"final_report\"]\n\nif isinstance(final_report_content, list):\n    for i, report_segment in enumerate(final_report_content):\n        print(f\"--- Report Segment {i+1} ---\")\n        print(report_segment)\n        print(\"\\n\" + \"=\"*80 + \"\\n\") # Clear separator\nelse:\n    print(final_report_content)",
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-11-23T23:04:37.454086Z",
+          "iopub.execute_input": "2025-11-23T23:04:37.454475Z",
+          "iopub.status.idle": "2025-11-23T23:05:06.832708Z",
+          "shell.execute_reply.started": "2025-11-23T23:04:37.454450Z",
+          "shell.execute_reply": "2025-11-23T23:05:06.831629Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    }
+  ]
+}
